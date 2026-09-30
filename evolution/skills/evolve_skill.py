@@ -268,24 +268,39 @@ def evolve(
 
     baseline_scores = []
     evolved_scores = []
+    skipped = 0
     for ex in holdout_examples:
-        # Score baseline
-        with dspy.context(lm=lm):
-            baseline_pred = baseline_module(task_input=ex.task_input)
-            baseline_score = skill_fitness_metric(ex, baseline_pred)
-            baseline_scores.append(baseline_score)
+        # A provider hiccup on ONE example must not discard an optimization that
+        # already ran: an agent asked to "execute the change" with no tools can
+        # return an empty response, and that would otherwise take down the whole
+        # run after the expensive part is already paid for.
+        try:
+            with dspy.context(lm=lm):
+                baseline_pred = baseline_module(task_input=ex.task_input)
+                baseline_score = skill_fitness_metric(ex, baseline_pred)
+                baseline_scores.append(baseline_score)
 
-            evolved_pred = optimized_module(task_input=ex.task_input)
-            evolved_score = skill_fitness_metric(ex, evolved_pred)
-            evolved_scores.append(evolved_score)
+                evolved_pred = optimized_module(task_input=ex.task_input)
+                evolved_score = skill_fitness_metric(ex, evolved_pred)
+                evolved_scores.append(evolved_score)
+        except Exception as e:  # noqa: BLE001 - transient provider/adapter failure
+            skipped += 1
+            console.print(
+                f"  [yellow]⚠ holdout example skipped ({type(e).__name__}: "
+                f"{str(e)[:100]})[/yellow]"
+            )
 
     avg_baseline = sum(baseline_scores) / max(1, len(baseline_scores))
     avg_evolved = sum(evolved_scores) / max(1, len(evolved_scores))
     improvement = avg_evolved - avg_baseline
 
+    # Report N/A rather than a score computed from a partial holdout: a delta
+    # over 2 of 5 examples is not the same claim as one over 5.
+    holdout_complete = skipped == 0 and len(evolved_scores) == len(holdout_examples)
+
     # Statistical significance: require min_improvement (relative) over baseline
     rel_improvement = improvement / max(0.001, avg_baseline)
-    significant = rel_improvement >= min_improvement
+    significant = holdout_complete and rel_improvement >= min_improvement
 
     # ── 9. Report results ───────────────────────────────────────────────
     table = Table(title="Evolution Results")
@@ -301,6 +316,13 @@ def evolve(
         f"{avg_evolved:.3f}",
         f"[{change_color}]{improvement:+.3f}[/{change_color}]",
     )
+    if skipped:
+        table.add_row(
+            "Holdout Coverage",
+            f"{len(holdout_examples)} examples",
+            f"{len(evolved_scores)} scored, {skipped} skipped",
+            "[yellow]incomplete[/yellow]",
+        )
     table.add_row(
         "Relative Δ",
         "—",
@@ -348,6 +370,9 @@ def evolve(
         "train_examples": len(dataset.train),
         "val_examples": len(dataset.val),
         "holdout_examples": len(dataset.holdout),
+        "holdout_scored": len(evolved_scores),
+        "holdout_skipped": skipped,
+        "holdout_complete": holdout_complete,
         "elapsed_seconds": elapsed,
         "constraints_passed": all_pass,
         "fitness": "llm_as_judge" if use_llm_judge else "keyword_overlap_heuristic",
@@ -357,7 +382,13 @@ def evolve(
 
     console.print(f"\n  Output saved to {output_dir}/")
 
-    if significant:
+    if not holdout_complete:
+        console.print(
+            f"\n[yellow]⚠ Holdout incomplete — {len(evolved_scores)}/{len(holdout_examples)} "
+            f"examples scored, {skipped} skipped by provider/adapter errors. "
+            f"No win is claimed.[/yellow]"
+        )
+    elif significant:
         console.print(f"\n[bold green]✓ Evolution improved skill by {improvement:+.3f} ({rel_improvement:+.1%} ≥ {min_improvement:.0%})[/bold green]")
         console.print(f"  Review the diff: diff {output_dir}/baseline_skill.md {output_dir}/evolved_skill.md")
     else:

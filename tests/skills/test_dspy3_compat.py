@@ -153,6 +153,26 @@ def test_llm_judge_metric_scores_empty_output_zero():
 
 # ── 3. MIPROv2 fallback must not be the silent failure path ────────────────
 
+def test_holdout_scoring_survives_a_provider_failure():
+    """Regression: one holdout example answered by an agent with no tools can
+    return an empty response, and that killed the whole run AFTER the
+    expensive optimization had finished — a 35-minute run discarded over one
+    bad example. The loop must skip and continue."""
+    import inspect
+    from evolution.skills import evolve_skill
+
+    src = inspect.getsource(evolve_skill.evolve)
+    # The holdout loop must catch provider/adapter errors per example...
+    assert "except Exception" in src, "holdout loop has no per-example guard"
+    # ...count them...
+    assert "skipped" in src, "skipped holdout examples are not counted"
+    # ...and refuse to claim a win on an incomplete holdout.
+    assert "holdout_complete" in src, "incomplete holdout is not detected"
+    assert "holdout_complete and rel_improvement >= min_improvement" in src, (
+        "a win can still be declared on a partial holdout"
+    )
+
+
 def test_every_lm_built_from_config_gets_a_token_cap():
     """Regression: reasoning models spend most of the completion budget on
     hidden `reasoning` tokens. With no cap the reply is truncated at
