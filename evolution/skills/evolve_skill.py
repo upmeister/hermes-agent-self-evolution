@@ -90,6 +90,7 @@ def evolve(
     run_tests: bool = False,
     dry_run: bool = False,
     use_llm_judge: bool = True,
+    min_improvement: float = 0.10,  # 10% relative improvement required (PLAN.md)
 ):
     """Main evolution function — orchestrates the full optimization loop."""
 
@@ -165,7 +166,7 @@ def evolve(
     # ── 3. Validate constraints on baseline ─────────────────────────────
     console.print(f"\n[bold]Validating baseline constraints[/bold]")
     validator = ConstraintValidator(config)
-    baseline_constraints = validator.validate_all(skill["body"], "skill")
+    baseline_constraints = validator.validate_all(skill["body"], "skill", full_text=skill["raw"])
     all_pass = True
     for c in baseline_constraints:
         icon = "✓" if c.passed else "✗"
@@ -225,18 +226,17 @@ def evolve(
     console.print(f"\n  Optimization completed in {elapsed:.1f}s")
 
     # ── 6. Extract evolved skill text ───────────────────────────────────
-    # GEPA rewrote the predictor's instructions, so the evolved skill is the
-    # text after the marker — not the stale `skill_text` attribute, which still
-    # holds the baseline and would report a byte-identical "evolved" skill.
-    # ChainOfThought wraps a Predict: the signature is on `.predict`.
-    evolved_body = SkillModule.extract_skill_text(
-        optimized_module.predictor.predict.signature.instructions
-    )
+    # skill_text is now a property reading live instructions — no stale attr.
+    evolved_body = optimized_module.skill_text
     evolved_full = reassemble_skill(skill["frontmatter"], evolved_body)
 
     # ── 7. Validate evolved skill ───────────────────────────────────────
     console.print(f"\n[bold]Validating evolved skill[/bold]")
-    evolved_constraints = validator.validate_all(evolved_body, "skill", baseline_text=skill["body"])
+    # Use validate_skill: it reassembles frontmatter+body internally so the
+    # structure check runs against the full artifact (not bare body).
+    evolved_constraints = validator.validate_skill(
+        evolved_body, frontmatter=skill["frontmatter"], baseline_body=skill["body"]
+    )
     all_pass = True
     for c in evolved_constraints:
         icon = "✓" if c.passed else "✗"
@@ -247,8 +247,9 @@ def evolve(
 
     if not all_pass:
         console.print("[red]✗ Evolved skill FAILED constraints — not deploying[/red]")
-        # Still save for inspection
-        output_path = Path("output") / skill_name / "evolved_FAILED.md"
+        # Still save for inspection with timestamp to avoid overwriting
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = Path("output") / skill_name / f"evolved_FAILED_{timestamp}.md"
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(evolved_full)
         console.print(f"  Saved failed variant to {output_path}")
@@ -276,6 +277,10 @@ def evolve(
     avg_evolved = sum(evolved_scores) / max(1, len(evolved_scores))
     improvement = avg_evolved - avg_baseline
 
+    # Statistical significance: require min_improvement (relative) over baseline
+    rel_improvement = improvement / max(0.001, avg_baseline)
+    significant = rel_improvement >= min_improvement
+
     # ── 9. Report results ───────────────────────────────────────────────
     table = Table(title="Evolution Results")
     table.add_column("Metric", style="bold")
@@ -283,7 +288,7 @@ def evolve(
     table.add_column("Evolved", justify="right")
     table.add_column("Change", justify="right")
 
-    change_color = "green" if improvement > 0 else "red"
+    change_color = "green" if significant else "red"
     table.add_row(
         "Holdout Score",
         f"{avg_baseline:.3f}",
@@ -291,10 +296,16 @@ def evolve(
         f"[{change_color}]{improvement:+.3f}[/{change_color}]",
     )
     table.add_row(
+        "Relative Δ",
+        "—",
+        f"{rel_improvement:+.1%}",
+        f"[{'green' if significant else 'red'}]{'≥ threshold' if significant else 'below threshold'}[/]",
+    )
+    table.add_row(
         "Skill Size",
         f"{len(skill['body']):,} chars",
-        f"{len(evolved_body):,} chars",
-        f"{len(evolved_body) - len(skill['body']):+,} chars",
+        f"{len(optimized_module.skill_text):,} chars",
+        f"{len(optimized_module.skill_text) - len(skill['body']):+,} chars",
     )
     table.add_row("Time", "", f"{elapsed:.1f}s", "")
     table.add_row("Iterations", "", str(iterations), "")
@@ -323,8 +334,11 @@ def evolve(
         "baseline_score": avg_baseline,
         "evolved_score": avg_evolved,
         "improvement": improvement,
+        "rel_improvement": rel_improvement,
+        "significant": significant,
+        "min_improvement_threshold": min_improvement,
         "baseline_size": len(skill["body"]),
-        "evolved_size": len(evolved_body),
+        "evolved_size": len(optimized_module.skill_text),
         "train_examples": len(dataset.train),
         "val_examples": len(dataset.val),
         "holdout_examples": len(dataset.holdout),
@@ -337,11 +351,11 @@ def evolve(
 
     console.print(f"\n  Output saved to {output_dir}/")
 
-    if improvement > 0:
-        console.print(f"\n[bold green]✓ Evolution improved skill by {improvement:+.3f} ({improvement/max(0.001, avg_baseline)*100:+.1f}%)[/bold green]")
+    if significant:
+        console.print(f"\n[bold green]✓ Evolution improved skill by {improvement:+.3f} ({rel_improvement:+.1%} ≥ {min_improvement:.0%})[/bold green]")
         console.print(f"  Review the diff: diff {output_dir}/baseline_skill.md {output_dir}/evolved_skill.md")
     else:
-        console.print(f"\n[yellow]⚠ Evolution did not improve skill (change: {improvement:+.3f})[/yellow]")
+        console.print(f"\n[yellow]⚠ Evolution did not meet significance threshold ({rel_improvement:+.1%} < {min_improvement:.0%})[/yellow]")
         console.print("  Try: more iterations, better eval dataset, or different optimizer model")
 
 
@@ -358,7 +372,9 @@ def evolve(
 @click.option("--dry-run", is_flag=True, help="Validate setup without running optimization")
 @click.option("--legacy-metric", is_flag=True,
               help="Use the keyword-overlap fitness instead of LLM-as-judge")
-def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run, legacy_metric):
+@click.option("--min-improvement", default=0.10, type=float,
+              help="Minimum relative improvement (default 10%, per PLAN.md)")
+def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run, legacy_metric, min_improvement):
     """Evolve a Hermes Agent skill using DSPy + GEPA optimization."""
     evolve(
         skill_name=skill,
@@ -371,6 +387,7 @@ def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_mod
         run_tests=run_tests,
         dry_run=dry_run,
         use_llm_judge=not legacy_metric,
+        min_improvement=min_improvement,
     )
 
 
