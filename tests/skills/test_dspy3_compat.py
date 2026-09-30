@@ -153,6 +153,35 @@ def test_llm_judge_metric_scores_empty_output_zero():
 
 # ── 3. MIPROv2 fallback must not be the silent failure path ────────────────
 
+def test_every_lm_built_from_config_gets_a_token_cap():
+    """Regression: reasoning models spend most of the completion budget on
+    hidden `reasoning` tokens. With no cap the reply is truncated at
+    finish_reason=length, DSPy surfaces "The LM returned an empty or null
+    response", and GEPA silently stops proposing candidates — the run still
+    reports success. Every dspy.LM built from an EvolutionConfig must carry a
+    cap."""
+    import inspect
+    import dspy
+    from evolution.core.config import EvolutionConfig
+    import evolution.core.fitness as fitness_mod
+    import evolution.core.dataset_builder as builder_mod
+
+    assert EvolutionConfig().max_tokens > 0, "config must carry a default cap"
+
+    # fitness: LLMJudge.score builds its own LM
+    src = inspect.getsource(fitness_mod.LLMJudge.score)
+    assert "max_tokens=" in src, "LLMJudge LM has no token cap"
+
+    # dataset builder: SyntheticDatasetBuilder.generate
+    src = inspect.getsource(builder_mod.SyntheticDatasetBuilder.generate)
+    assert "max_tokens=" in src, "dataset generator LM has no token cap"
+
+    # and the CLI must pass its own --max-tokens through to the LM
+    from evolution.skills import evolve_skill
+    src = inspect.getsource(evolve_skill.evolve)
+    assert "max_tokens=max_tokens" in src, "CLI --max-tokens not wired to the LM"
+
+
 def test_cli_builds_gepa_with_supported_budget():
     """The optimizer factory must produce a real GEPA without raising, and the
     budget kwarg it passes must be one DSPy 3.x actually accepts.

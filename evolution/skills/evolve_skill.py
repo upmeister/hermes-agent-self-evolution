@@ -91,6 +91,7 @@ def evolve(
     dry_run: bool = False,
     use_llm_judge: bool = True,
     min_improvement: float = 0.10,  # 10% relative improvement required (PLAN.md)
+    max_tokens: int = 8000,  # headroom for reasoning models' hidden tokens
 ):
     """Main evolution function — orchestrates the full optimization loop."""
 
@@ -184,8 +185,13 @@ def evolve(
     console.print(f"  Optimizer model: {optimizer_model}")
     console.print(f"  Eval model: {eval_model}")
 
-    # Configure DSPy
-    lm = dspy.LM(eval_model)
+    # Configure DSPy.
+    # max_tokens is not optional for reasoning models: they spend most of the
+    # budget on hidden `reasoning` tokens, so a small cap truncates the reply
+    # at finish_reason=length and the structured output comes back empty, which
+    # DSPy reports as "empty or null response" and the optimizer silently skips
+    # the candidate. Default 8000 leaves room for reasoning plus the payload.
+    lm = dspy.LM(eval_model, max_tokens=max_tokens)
     dspy.configure(lm=lm)
 
     # Fitness signal. The legacy default is a keyword-overlap heuristic that
@@ -374,7 +380,9 @@ def evolve(
               help="Use the keyword-overlap fitness instead of LLM-as-judge")
 @click.option("--min-improvement", default=0.10, type=float,
               help="Minimum relative improvement (default 10%, per PLAN.md)")
-def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run, legacy_metric, min_improvement):
+@click.option("--max-tokens", default=8000, type=int,
+              help="Completion token cap (default 8000; reasoning models need headroom)")
+def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run, legacy_metric, min_improvement, max_tokens):
     """Evolve a Hermes Agent skill using DSPy + GEPA optimization."""
     evolve(
         skill_name=skill,
@@ -388,6 +396,7 @@ def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_mod
         dry_run=dry_run,
         use_llm_judge=not legacy_metric,
         min_improvement=min_improvement,
+        max_tokens=max_tokens,
     )
 
 

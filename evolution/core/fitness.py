@@ -71,7 +71,10 @@ class LLMJudge:
     ) -> FitnessScore:
         """Score an agent output using LLM-as-judge."""
 
-        lm = dspy.LM(self.config.eval_model)
+        # The cap matters for reasoning models: they spend most of the budget
+        # on hidden `reasoning` tokens, so a low cap truncates the reply and the
+        # typed output fields below parse as empty.
+        lm = dspy.LM(self.config.eval_model, max_tokens=self.config.max_tokens)
 
         with dspy.context(lm=lm):
             result = self.judge(
