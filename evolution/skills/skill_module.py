@@ -84,12 +84,23 @@ def find_skill(skill_name: str, hermes_agent_path: Path) -> Optional[Path]:
 class SkillModule(dspy.Module):
     """A DSPy module that wraps a skill file for optimization.
 
-    The skill text (body) is the parameter that GEPA optimizes.
-    On each forward pass, the module:
-    1. Uses the skill text as instructions
-    2. Processes the task input
-    3. Returns the agent's response
+    The skill text is the parameter GEPA optimizes, and it is carried in the
+    predictor's *instructions* — that is the only channel GEPA mutates. GEPA
+    seeds its candidate space from
+    `{name: pred.signature.instructions for ...}` and rewrites those strings
+    reflectively. A `self.skill_text` attribute sitting next to the predictor
+    is invisible to it, so an "optimized" module can come back byte-identical.
+
+    The docstring prefix is load-bearing: `SkillModule.extract_skill_text()`
+    splits an evolved instruction back into the skill body, so whatever GEPA
+    writes after the marker is the evolved skill.
+
+    Note the access path: `dspy.ChainOfThought` is a `Predict` wrapper, so the
+    signature lives on `self.predictor.predict.signature`, and that is also the
+    key GEPA reports in `named_predictors()` ("predict").
     """
+
+    SKILL_MARKER = "<!-- SKILL TEXT -->"
 
     class TaskWithSkill(dspy.Signature):
         """Complete a task following the provided skill instructions.
@@ -105,6 +116,33 @@ class SkillModule(dspy.Module):
         super().__init__()
         self.skill_text = skill_text
         self.predictor = dspy.ChainOfThought(self.TaskWithSkill)
+        # Put the skill INTO the instructions — the only text GEPA can evolve.
+        self._sync_instructions()
+
+    @property
+    def _signature(self):
+        """The signature GEPA mutates (ChainOfThought -> Predict wrapper)."""
+        return self.predictor.predict.signature
+
+    def _sync_instructions(self):
+        base = self.TaskWithSkill.instructions
+        prefix = base.split(self.SKILL_MARKER)[0].rstrip()
+        self._signature.instructions = (
+            f"{prefix}\n\n{self.SKILL_MARKER}\n{self.skill_text}"
+        )
+
+    @classmethod
+    def extract_skill_text(cls, instructions: Optional[str]) -> str:
+        """Recover the skill body from an evolved instruction string.
+
+        An evolved instruction may have rewritten the whole prompt, so fall
+        back to the full text when the marker is gone rather than returning "".
+        """
+        if not instructions:
+            return ""
+        if cls.SKILL_MARKER in instructions:
+            return instructions.split(cls.SKILL_MARKER, 1)[1].strip()
+        return instructions.strip()
 
     def forward(self, task_input: str) -> dspy.Prediction:
         result = self.predictor(
@@ -112,6 +150,11 @@ class SkillModule(dspy.Module):
             task_input=task_input,
         )
         return dspy.Prediction(output=result.output)
+
+    @property
+    def evolved_skill_text(self) -> str:
+        """The skill text as it currently lives inside the instructions."""
+        return self.extract_skill_text(self._signature.instructions)
 
 
 def reassemble_skill(frontmatter: str, evolved_body: str) -> str:

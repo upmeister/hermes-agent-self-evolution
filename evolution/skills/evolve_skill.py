@@ -21,7 +21,13 @@ from rich.table import Table
 from evolution.core.config import EvolutionConfig, resolve_hermes_agent_path
 from evolution.core.dataset_builder import SyntheticDatasetBuilder, EvalDataset, GoldenDatasetLoader
 from evolution.core.external_importers import build_dataset_from_external
-from evolution.core.fitness import skill_fitness_metric, LLMJudge, FitnessScore
+from evolution.core.fitness import (
+    skill_fitness_metric,
+    make_gepa_metric,
+    make_llm_judge_metric,
+    LLMJudge,
+    FitnessScore,
+)
 from evolution.core.constraints import ConstraintValidator
 from evolution.skills.skill_module import (
     SkillModule,
@@ -31,6 +37,46 @@ from evolution.skills.skill_module import (
 )
 
 console = Console()
+
+
+def build_gepa_optimizer(metric, iterations: int, reflection_lm=None):
+    """Build a GEPA optimizer using the budget knob the installed DSPy exposes.
+
+    DSPy 3.x renamed the iteration budget: `max_steps` no longer exists and
+    passing it raises `GEPA.__init__() got an unexpected keyword argument`.
+    The current knobs are `max_metric_calls` (budget in metric invocations,
+    the unit that actually bounds cost) and `max_full_evals`.
+
+    `iterations` is translated into full-eval equivalents so the CLI flag keeps
+    its documented meaning while the enforced unit becomes metric calls.
+    """
+    import inspect
+
+    # Inspect the CLASS, not `__init__` of an instance: budget knobs such as
+    # max_metric_calls are keyword-only args declared on __init__, so reading
+    # a bound/unbound method can miss them depending on how it is wrapped.
+    params = set(inspect.signature(dspy.GEPA).parameters) | set(
+        inspect.signature(dspy.GEPA.__init__).parameters
+    )
+    kwargs = {"metric": metric}
+
+    if reflection_lm is not None:
+        kwargs["reflection_lm"] = reflection_lm
+
+    if "max_metric_calls" in params:
+        # 1 iteration ~ a few metric calls; use the call budget directly.
+        kwargs["max_metric_calls"] = max(1, iterations) * 4
+    elif "max_full_evals" in params:
+        kwargs["max_full_evals"] = max(1, iterations)
+    elif "max_steps" in params:  # pragma: no cover - legacy DSPy
+        kwargs["max_steps"] = max(1, iterations)
+    else:  # pragma: no cover - unknown DSPy
+        raise TypeError(
+            "dspy.GEPA exposes no budget knob (max_metric_calls / max_full_evals / "
+            "max_steps); refusing to start an unbounded optimization"
+        )
+
+    return dspy.GEPA(**kwargs)
 
 
 def evolve(
@@ -43,6 +89,7 @@ def evolve(
     hermes_repo: Optional[str] = None,
     run_tests: bool = False,
     dry_run: bool = False,
+    use_llm_judge: bool = True,
 ):
     """Main evolution function — orchestrates the full optimization loop."""
 
@@ -140,7 +187,21 @@ def evolve(
     lm = dspy.LM(eval_model)
     dspy.configure(lm=lm)
 
-    # Create the baseline skill module
+    # Fitness signal. The legacy default is a keyword-overlap heuristic that
+    # scores word frequency, not behaviour — optimising it produces skills that
+    # merely echo the rubric. LLM-as-judge scores correctness /
+    # procedure_following / conciseness and returns feedback GEPA can reflect on.
+    if use_llm_judge:
+        base_metric = make_llm_judge_metric(config, judge_lm=lm)
+        console.print("  Fitness: LLM-as-judge (correctness/procedure/conciseness)")
+    else:
+        base_metric = skill_fitness_metric
+        console.print("  Fitness: keyword-overlap heuristic (legacy)")
+
+    # DSPy 3.x calls the metric with five positional args.
+    metric = make_gepa_metric(base_metric)
+
+    # Create the baseline skill module (skill text lives in its instructions)
     baseline_module = SkillModule(skill["body"])
 
     # Prepare DSPy examples
@@ -152,35 +213,24 @@ def evolve(
 
     start_time = time.time()
 
-    try:
-        optimizer = dspy.GEPA(
-            metric=skill_fitness_metric,
-            max_steps=iterations,
-        )
+    optimizer = build_gepa_optimizer(metric, iterations, reflection_lm=lm)
 
-        optimized_module = optimizer.compile(
-            baseline_module,
-            trainset=trainset,
-            valset=valset,
-        )
-    except Exception as e:
-        # Fall back to MIPROv2 if GEPA isn't available in this DSPy version
-        console.print(f"[yellow]GEPA not available ({e}), falling back to MIPROv2[/yellow]")
-        optimizer = dspy.MIPROv2(
-            metric=skill_fitness_metric,
-            auto="light",
-        )
-        optimized_module = optimizer.compile(
-            baseline_module,
-            trainset=trainset,
-        )
+    optimized_module = optimizer.compile(
+        baseline_module,
+        trainset=trainset,
+        valset=valset,
+    )
 
     elapsed = time.time() - start_time
     console.print(f"\n  Optimization completed in {elapsed:.1f}s")
 
     # ── 6. Extract evolved skill text ───────────────────────────────────
-    # The optimized module's instructions contain the evolved skill text
-    evolved_body = optimized_module.skill_text
+    # GEPA rewrote the predictor's instructions, so the evolved skill is the
+    # text after the marker — not the stale `skill_text` attribute, which still
+    # holds the baseline and would report a byte-identical "evolved" skill.
+    evolved_body = SkillModule.extract_skill_text(
+        optimized_module.predictor.signature.instructions
+    )
     evolved_full = reassemble_skill(skill["frontmatter"], evolved_body)
 
     # ── 7. Validate evolved skill ───────────────────────────────────────
@@ -279,6 +329,8 @@ def evolve(
         "holdout_examples": len(dataset.holdout),
         "elapsed_seconds": elapsed,
         "constraints_passed": all_pass,
+        "fitness": "llm_as_judge" if use_llm_judge else "keyword_overlap_heuristic",
+        "optimizer_backend": "GEPA",
     }
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
 
@@ -303,7 +355,9 @@ def evolve(
 @click.option("--hermes-repo", default=None, help="Path to hermes-agent repo")
 @click.option("--run-tests", is_flag=True, help="Run full pytest suite as constraint gate")
 @click.option("--dry-run", is_flag=True, help="Validate setup without running optimization")
-def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run):
+@click.option("--legacy-metric", is_flag=True,
+              help="Use the keyword-overlap fitness instead of LLM-as-judge")
+def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run, legacy_metric):
     """Evolve a Hermes Agent skill using DSPy + GEPA optimization."""
     evolve(
         skill_name=skill,
@@ -315,6 +369,7 @@ def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_mod
         hermes_repo=hermes_repo,
         run_tests=run_tests,
         dry_run=dry_run,
+        use_llm_judge=not legacy_metric,
     )
 
 
