@@ -84,6 +84,31 @@ def test_extract_skill_text_handles_empty_instructions():
 
 # ── the stale-attribute trap the CLI hit ────────────────────────────────────
 
+def test_cli_reads_evolved_text_through_predictor_predict_signature():
+    """Regression: the CLI once read `optimized_module.predictor.signature`,
+    which does not exist — ChainOfThought wraps a Predict, so the signature
+    lives on `.predict`. The whole run died at the extraction step AFTER a
+    14-minute optimization, so pin the access path used by the CLI."""
+    from evolution.skills.skill_module import SkillModule as SM
+
+    class Optimized:
+        def __init__(self, instructions):
+            self.skill_text = "BASELINE STALE"
+            self.predictor = dspy.ChainOfThought(SM.TaskWithSkill)
+            self.predictor.predict.signature.instructions = instructions
+
+    optimized = Optimized(
+        f"prefix\n\n{SM.SKILL_MARKER}\nEVOLVED SKILL BODY"
+    )
+    # The exact expression the CLI must use:
+    got = SM.extract_skill_text(
+        optimized.predictor.predict.signature.instructions
+    )
+    assert got == "EVOLVED SKILL BODY"
+    # ...and it must NOT be the stale attribute
+    assert got != optimized.skill_text
+
+
 def test_evolved_skill_text_property_reflects_instructions_not_stale_attr():
     """`skill_text` stays at the baseline; the property must read the live
     instructions, which is what the CLI now uses."""

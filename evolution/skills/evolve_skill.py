@@ -228,8 +228,9 @@ def evolve(
     # GEPA rewrote the predictor's instructions, so the evolved skill is the
     # text after the marker — not the stale `skill_text` attribute, which still
     # holds the baseline and would report a byte-identical "evolved" skill.
+    # ChainOfThought wraps a Predict: the signature is on `.predict`.
     evolved_body = SkillModule.extract_skill_text(
-        optimized_module.predictor.signature.instructions
+        optimized_module.predictor.predict.signature.instructions
     )
     evolved_full = reassemble_skill(skill["frontmatter"], evolved_body)
 
