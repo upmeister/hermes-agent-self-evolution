@@ -91,7 +91,7 @@ def evolve(
     dry_run: bool = False,
     use_llm_judge: bool = True,
     min_improvement: float = 0.10,  # 10% relative improvement required (PLAN.md)
-    max_tokens: int = 8000,  # headroom for reasoning models' hidden tokens
+    max_tokens: int = 20000,  # headroom for reasoning models' hidden tokens
 ):
     """Main evolution function — orchestrates the full optimization loop."""
 
@@ -380,8 +380,8 @@ def evolve(
               help="Use the keyword-overlap fitness instead of LLM-as-judge")
 @click.option("--min-improvement", default=0.10, type=float,
               help="Minimum relative improvement (default 10%, per PLAN.md)")
-@click.option("--max-tokens", default=8000, type=int,
-              help="Completion token cap (default 8000; reasoning models need headroom)")
+@click.option("--max-tokens", default=20000, type=int,
+              help="Completion token cap (default 20000; reasoning models need headroom)")
 def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run, legacy_metric, min_improvement, max_tokens):
     """Evolve a Hermes Agent skill using DSPy + GEPA optimization."""
     evolve(

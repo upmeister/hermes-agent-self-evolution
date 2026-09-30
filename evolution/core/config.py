@@ -29,7 +29,14 @@ class EvolutionConfig:
     # a low cap truncates the reply at finish_reason=length and DSPy sees an
     # empty string — surfacing as "empty or null response" rather than a
     # truncation the caller can diagnose.
-    max_tokens: int = 8000
+    #
+    # 20000, not the smaller numbers that look sufficient: generating the eval
+    # dataset for a ~12KB skill measured 28.8k characters of reasoning before
+    # the first content token, and 8000 truncated the response into an
+    # unparseable prefix. The same request finished in 4968 completion tokens
+    # once the cap stopped cutting it off, so this is headroom for the
+    # reasoning trace, not a guess at output size.
+    max_tokens: int = 20000
 
     # Constraints
     max_skill_size: int = 15_000  # 15KB default
